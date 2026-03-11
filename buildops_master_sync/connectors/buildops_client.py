@@ -1,135 +1,186 @@
-"""
-BuildOps API Client
-
-Responsibilities:
-- Authenticate with BuildOps Public API
-- Handle token refresh
-- Fetch paginated resources
-- Support incremental filters via updatedAfter
-- Expose update timestamps for validation
-"""
-
-import os
-import time
 import requests
+import time
 from datetime import datetime
 
 
 class BuildOpsClient:
-    BASE_URL = "https://public-api.live.buildops.com/v1"
+    """
+    BuildOps API client.
+
+    Handles:
+    - authentication
+    - paging
+    - data retrieval
+    """
 
     def __init__(self, tenant_id):
+
+        self.tenant_id = (tenant_id or "").strip()
+
+        self.client_id = None
+        self.client_secret = None
+
+        self.base_url = "https://public-api.live.buildops.com/v1"
+
+        self.token = None
+        self.token_expiration = 0
+
+        self._load_credentials()
+
+        self.authenticate()
+
+    # -----------------------------------------------------
+    # LOAD CREDS
+    # -----------------------------------------------------
+
+    def _load_credentials(self):
+
+        import os
+
         self.client_id = os.getenv("BUILDOPS_CLIENT_ID")
         self.client_secret = os.getenv("BUILDOPS_CLIENT_SECRET")
-        self.tenant_id = tenant_id
 
         if not self.client_id or not self.client_secret:
             raise ValueError(
                 "BUILDOPS_CLIENT_ID and BUILDOPS_CLIENT_SECRET must be set"
             )
 
-        self.token = None
-        self.token_expires_at = 0
-        self._authenticate()
+    # -----------------------------------------------------
+    # AUTH
+    # -----------------------------------------------------
 
-    # ------------------------------------------------------------------
-    # Authentication
-    # ------------------------------------------------------------------
+    def authenticate(self):
 
-    def _authenticate(self):
-        url = f"{self.BASE_URL}/auth/token"
+        print(f"[BuildOps] Authenticating tenant {self.tenant_id}")
+
+        auth_url = f"{self.base_url}/auth/token"
+
         payload = {
             "clientId": self.client_id,
             "clientSecret": self.client_secret,
-            "tenantId": self.tenant_id,
+            "tenantId": self.tenant_id
         }
 
-        print(f"[BuildOps] Authenticating tenant {self.tenant_id}")
-        resp = requests.post(url, json=payload, timeout=30)
+        r = requests.post(auth_url, json=payload, timeout=30)
 
-        if resp.status_code != 200:
-            raise RuntimeError(
-                f"BuildOps auth failed ({resp.status_code}): {resp.text}"
+        if r.status_code != 200:
+            raise Exception(
+                f"BuildOps auth failed ({r.status_code}): {r.text}"
             )
 
-        data = resp.json()
-        self.token = data["access_token"]
-        self.token_expires_at = time.time() + data["expires_in"]
+        data = r.json()
 
-    def _refresh_if_needed(self):
-        if time.time() >= self.token_expires_at - 60:
-            self._authenticate()
+        self.token = data["access_token"]
+        self.token_expiration = time.time() + data["expires_in"]
+
+    # -----------------------------------------------------
+    # TOKEN REFRESH
+    # -----------------------------------------------------
+
+    def refresh_if_needed(self):
+
+        if time.time() >= self.token_expiration - 60:
+            self.authenticate()
+
+    # -----------------------------------------------------
+    # HEADERS
+    # -----------------------------------------------------
 
     def _headers(self):
-        self._refresh_if_needed()
+
+        self.refresh_if_needed()
+
         return {
-            "Authorization": f"Bearer {self.token}",
             "Accept": "application/json",
-            "tenantId": self.tenant_id,
+            "Authorization": f"Bearer {self.token}",
+            "tenantId": self.tenant_id
         }
 
-    # ------------------------------------------------------------------
-    # Timestamp helpers (NEW)
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------
+    # TIMESTAMP HELPERS
+    # -----------------------------------------------------
+
+    @staticmethod
+    def _parse_datetime(value):
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except Exception:
+            return None
 
     @staticmethod
     def extract_updated_timestamp(obj):
         """
-        Best-effort extraction of update timestamp from BuildOps payload.
+        Best-effort extraction of the most useful update timestamp from
+        BuildOps payloads.
+
+        Used for:
+        - observation logging
+        - client-side incremental filtering where API filters are unavailable
         """
         audit = obj.get("audit") or {}
-        ts = (
-            audit.get("lastUpdatedDate")
-            or audit.get("lastUpdatedDateTime")
-            or audit.get("createdDate")
+
+        candidates = [
+            audit.get("lastUpdatedDate"),
+            obj.get("offlineUpdatedDateTime"),
+            audit.get("createdDate"),
+        ]
+
+        for candidate in candidates:
+            parsed = BuildOpsClient._parse_datetime(candidate)
+            if parsed:
+                return parsed
+
+        return None
+
+    # -----------------------------------------------------
+    # CUSTOMERS
+    # -----------------------------------------------------
+
+    def fetch_customers_page(self, page=0, limit=100, updated_after=None):
+
+        print(
+            f"[BuildOps] Fetching CUSTOMERS page {page} "
+            f"(tenant {self.tenant_id})"
         )
 
-        if not ts:
-            return None
+        url = f"{self.base_url}/customers"
 
-        try:
-            return datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
-        except Exception:
-            return None
+        params = {
+            "include_inactive": "true",
+            "page": page,
+            "limit": limit,
+        }
 
-    # ------------------------------------------------------------------
-    # Customers
-    # ------------------------------------------------------------------
+        if updated_after:
+            params["updatedAfter"] = updated_after.isoformat()
+
+        resp = requests.get(url, headers=self._headers(), params=params, timeout=30)
+
+        if resp.status_code != 200:
+            raise Exception(
+                f"Failed to fetch customers page {page}: "
+                f"{resp.status_code} {resp.text}"
+            )
+
+        data = resp.json()
+
+        return data.get("items", []), data.get("totalCount", 0)
 
     def fetch_all_customers(self, limit=100, updated_after=None):
+
         all_items = []
         page = 0
 
         while True:
-            print(
-                f"[BuildOps] Fetching CUSTOMERS page {page} "
-                f"(tenant {self.tenant_id})"
+
+            items, total = self.fetch_customers_page(
+                page=page,
+                limit=limit,
+                updated_after=updated_after
             )
 
-            params = {
-                "page": page,
-                "limit": limit,
-                "include_inactive": "true",
-            }
-
-            if updated_after:
-                params["updatedAfter"] = updated_after.isoformat()
-
-            resp = requests.get(
-                f"{self.BASE_URL}/customers",
-                headers=self._headers(),
-                params=params,
-                timeout=30,
-            )
-
-            if resp.status_code != 200:
-                raise RuntimeError(
-                    f"Failed to fetch customers (page {page}): "
-                    f"{resp.status_code} {resp.text}"
-                )
-
-            data = resp.json()
-            items = data.get("items", [])
             all_items.extend(items)
 
             if len(items) < limit:
@@ -139,43 +190,163 @@ class BuildOpsClient:
 
         return all_items
 
-    # ------------------------------------------------------------------
-    # Jobs
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------
+    # EMPLOYEES
+    # -----------------------------------------------------
 
-    def fetch_all_jobs(self, limit=100, updated_after=None):
+    def fetch_employees_page(self, page=0, limit=100):
+
+        print(
+            f"[BuildOps] Fetching EMPLOYEES page {page} "
+            f"(tenant {self.tenant_id})"
+        )
+
+        url = f"{self.base_url}/employees"
+
+        params = {
+            "include_inactive": "true",
+            "page": page,
+            "page_size": limit,
+        }
+
+        resp = requests.get(url, headers=self._headers(), params=params, timeout=30)
+
+        if resp.status_code != 200:
+            raise Exception(
+                f"Failed to fetch employees page {page}: "
+                f"{resp.status_code} {resp.text}"
+            )
+
+        data = resp.json()
+
+        return data.get("items", []), data.get("totalCount", 0)
+
+    def fetch_all_employees(self, limit=100, updated_after=None):
+        """
+        Employees endpoint does not document updatedAfter.
+        We fetch all pages and optionally filter client-side.
+        """
+
         all_items = []
         page = 0
 
         while True:
-            print(
-                f"[BuildOps] Fetching JOBS page {page} "
-                f"(tenant {self.tenant_id})"
+
+            items, total = self.fetch_employees_page(page=page, limit=limit)
+
+            all_items.extend(items)
+
+            if len(items) < limit:
+                break
+
+            page += 1
+
+        if not updated_after:
+            return all_items
+
+        filtered_items = []
+
+        for item in all_items:
+            ts = self.extract_updated_timestamp(item)
+            if ts and ts >= updated_after:
+                filtered_items.append(item)
+
+        return filtered_items
+
+    # -----------------------------------------------------
+    # JOBS
+    # -----------------------------------------------------
+
+    def fetch_jobs_page(self, page=0, limit=100, updated_after=None):
+
+        print(
+            f"[BuildOps] Fetching JOBS page {page} "
+            f"(tenant {self.tenant_id})"
+        )
+
+        url = f"{self.base_url}/jobs"
+
+        params = {
+            "page": page,
+            "page_size": limit,
+        }
+
+        if updated_after:
+            params["updatedAfter"] = updated_after.isoformat()
+
+        resp = requests.get(url, headers=self._headers(), params=params, timeout=30)
+
+        if resp.status_code != 200:
+            raise Exception(
+                f"Failed to fetch jobs page {page}: "
+                f"{resp.status_code} {resp.text}"
             )
 
-            params = {
-                "page": page,
-                "page_size": limit,
-            }
+        data = resp.json()
 
-            if updated_after:
-                params["updatedAfter"] = updated_after.isoformat()
+        return data.get("items", []), data.get("totalCount", 0)
 
-            resp = requests.get(
-                f"{self.BASE_URL}/jobs",
-                headers=self._headers(),
-                params=params,
-                timeout=30,
+    def fetch_all_jobs(self, limit=100, updated_after=None):
+
+        all_items = []
+        page = 0
+
+        while True:
+
+            items, total = self.fetch_jobs_page(
+                page=page,
+                limit=limit,
+                updated_after=updated_after
             )
 
-            if resp.status_code != 200:
-                raise RuntimeError(
-                    f"Failed to fetch jobs (page {page}): "
-                    f"{resp.status_code} {resp.text}"
-                )
+            all_items.extend(items)
 
-            data = resp.json()
-            items = data.get("items", [])
+            if len(items) < limit:
+                break
+
+            page += 1
+
+        return all_items
+
+    # -----------------------------------------------------
+    # QUOTES
+    # -----------------------------------------------------
+
+    def fetch_quotes_page(self, page=0, limit=100):
+
+        print(
+            f"[BuildOps] Fetching QUOTES page {page} "
+            f"(tenant {self.tenant_id})"
+        )
+
+        url = f"{self.base_url}/quotes"
+
+        params = {
+            "page": page,
+            "page_size": limit,
+        }
+
+        resp = requests.get(url, headers=self._headers(), params=params, timeout=30)
+
+        if resp.status_code != 200:
+            raise Exception(
+                f"Failed to fetch quotes page {page}: "
+                f"{resp.status_code} {resp.text}"
+            )
+
+        data = resp.json()
+
+        return data.get("items", []), data.get("totalCount", 0)
+
+    def fetch_all_quotes(self, limit=100):
+
+        all_items = []
+        page = 0
+
+        while True:
+
+            items, total = self.fetch_quotes_page(page=page, limit=limit)
+
             all_items.extend(items)
 
             if len(items) < limit:
